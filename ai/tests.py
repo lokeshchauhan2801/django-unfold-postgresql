@@ -26,7 +26,7 @@ class AIProviderConfigurationTests(SimpleTestCase):
         AI_API_KEY="",
         OPENAI_API_KEY="openai-key",
     )
-    @patch("apps.ai.providers.ChatOpenAI")
+    @patch("ai.providers.ChatOpenAI")
     def test_openai_uses_the_existing_api_key_setting(self, chat_openai):
         get_ai_provider()
 
@@ -43,7 +43,7 @@ class AIProviderConfigurationTests(SimpleTestCase):
         AI_BASE_URL="https://api.deepseek.com/v1",
         OPENAI_API_KEY="embedding-key",
     )
-    @patch("apps.ai.providers.ChatOpenAI")
+    @patch("ai.providers.ChatOpenAI")
     def test_openai_compatible_provider_uses_configured_model_and_endpoint(
         self,
         chat_openai,
@@ -62,7 +62,7 @@ class AIProviderConfigurationTests(SimpleTestCase):
         AI_API_KEY="provider-key",
         AI_BASE_URL="https://api.deepseek.com/v1",
     )
-    @patch("apps.ai.providers.ChatOpenAI")
+    @patch("ai.providers.ChatOpenAI")
     def test_openai_compatible_provider_uses_function_calling_for_structured_output(
         self,
         chat_openai,

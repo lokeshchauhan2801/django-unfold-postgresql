@@ -185,7 +185,7 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
-      DJANGO_SETTINGS_MODULE: config.settings.production
+      DJANGO_SETTINGS_MODULE: base.settings.production
       POSTGRES_HOST: postgres
       REDIS_URL: redis://redis:6379/0
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
@@ -198,7 +198,7 @@ services:
     command: >-
       sh -c "python manage.py migrate &&
              python manage.py collectstatic --noinput &&
-             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4"
+             gunicorn base.wsgi:application --bind 0.0.0.0:8000 --workers 4"
 
   # ─────────────────────────────────────────
   # Celery workers
@@ -217,13 +217,13 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
-      DJANGO_SETTINGS_MODULE: config.settings.production
+      DJANGO_SETTINGS_MODULE: base.settings.production
       POSTGRES_HOST: postgres
       REDIS_URL: redis://redis:6379/0
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     volumes:
       - media_data:/app/media
-    command: celery -A config.celery worker --loglevel=info --concurrency=4
+    command: celery -A base.celery worker --loglevel=info --concurrency=4
 
   celery-beat:
     build:
@@ -238,12 +238,12 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
-      DJANGO_SETTINGS_MODULE: config.settings.production
+      DJANGO_SETTINGS_MODULE: base.settings.production
       POSTGRES_HOST: postgres
       REDIS_URL: redis://redis:6379/0
     volumes:
       - media_data:/app/media
-    command: celery -A config.celery beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    command: celery -A base.celery beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
 
 volumes:
   postgres_data:

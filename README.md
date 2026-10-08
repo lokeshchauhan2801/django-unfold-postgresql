@@ -9,8 +9,8 @@ A Django-based Demo Company for intelligent chat and document processing. Built 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Django Application                        │
-│  apps/chat  ·  apps/documents  ·  apps/users  ·  apps/knowledge │
-│  apps/companies  ·  apps/audit  ·  apps/files  ·  apps/common   │
+│  chat  ·  docs  ·  auth  ·  company  ·  ai  ·  audit             │
+│  basics  ·  scrapper  ·  infrastructure                         │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
           ┌────────────────────┼────────────────────┐
@@ -186,7 +186,7 @@ Copy `.env.example` to `.env` and override as needed.
 | `DJANGO_SECRET_KEY`         | *(required)*                   | Django secret key — use a strong random value    |
 | `DJANGO_DEBUG`              | `1`                            | Set to `0` in production                         |
 | `DJANGO_ALLOWED_HOSTS`      | `localhost,127.0.0.1,[::1]`    | Comma-separated allowed hosts                    |
-| `DJANGO_SETTINGS_MODULE`    | `config.settings.local`        | Settings module to use                           |
+| `DJANGO_SETTINGS_MODULE`    | `base.settings.local`           | Settings module to use                           |
 | `POSTGRES_DB`               | `aiplatform`                   | PostgreSQL database name                         |
 | `POSTGRES_USER`             | `aiplatform`                   | PostgreSQL user                                  |
 | `POSTGRES_PASSWORD`         | `aiplatform123`                | PostgreSQL password                              |
@@ -285,27 +285,18 @@ Run `make help` to see all available targets.
 ```
 django-unfold/
 │
-├── apps/                          # Django applications
-│   ├── ai/                        # AI provider abstraction layer
-│   ├── audit/                     # Audit log (stub)
-│   ├── charts/                    # Analytics & charts (stub)
-│   ├── chat/                      # Conversation & messaging
-│   ├── common/                    # Shared mixins & utilities (stub)
-│   ├── companies/                 # Multi-tenant company support (stub)
-│   ├── documents/                 # PDF upload & processing
-│   ├── files/                     # Generic file management (stub)
-│   ├── knowledge/                 # Knowledge base & RAG (stub)
-│   ├── schedules/                 # Scheduled tasks (stub)
-│   └── users/                     # Authentication & user profiles
+├── ai/                            # AI provider abstractions
+├── audit/                         # Audit logs
+├── auth/                          # Authentication and user model
+├── basics/                        # Shared models, middleware, admin
+├── chat/                          # Conversations and messaging
+├── company/                       # Company tenancy and memberships
+├── docs/                          # Document processing and chunks
+├── scrapper/                      # Document API and queue integration
 │
 ├── config/                        # Django project configuration
-│   ├── settings/
-│   │   ├── base.py                # Shared settings
-│   │   ├── local.py               # Development overrides (SQLite, DEBUG)
-│   │   └── production.py          # Production overrides (PostgreSQL, security)
-│   ├── urls.py                    # Root URL configuration
-│   ├── wsgi.py
-│   └── asgi.py
+│   └── ...                        # Compatibility imports for base project config
+├── base/                          # Active settings, URLs, WSGI, ASGI, Celery
 │
 ├── docker/
 │   └── Dockerfile.django          # Production Docker image
@@ -337,12 +328,12 @@ django-unfold/
 
 | Module                      | Use case                              |
 |-----------------------------|---------------------------------------|
-| `config.settings.local`     | Local development (default)           |
-| `config.settings.production`| Docker / production deployment        |
+| `base.settings.local`      | Local development (default)           |
+| `base.settings.production` | Docker / production deployment        |
 
 Override via environment variable:
 ```bash
-DJANGO_SETTINGS_MODULE=config.settings.production python manage.py runserver
+DJANGO_SETTINGS_MODULE=base.settings.production python manage.py runserver
 ```
 
 ---

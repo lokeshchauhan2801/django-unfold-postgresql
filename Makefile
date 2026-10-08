@@ -37,13 +37,13 @@ collectstatic:  ## Collect static files
 	$(MANAGE) collectstatic --noinput
 
 test:  ## Run tests
-	venv/bin/pytest tests/ apps/ -v
+	$(MANAGE) test
 
 lint:  ## Run ruff linter
-	venv/bin/ruff check apps/ infrastructure/ config/
+	venv/bin/ruff check ai audit auth base basics chat company config docs infrastructure scrapper tests
 
 format:  ## Format code
-	venv/bin/ruff format apps/ infrastructure/ config/
+	venv/bin/ruff format ai audit auth base basics chat company config docs infrastructure scrapper tests
 
 docker-up:  ## Start all infrastructure services
 	docker-compose up -d postgres redis kafka chromadb langfuse temporal temporal-ui
@@ -55,10 +55,10 @@ docker-logs:  ## Tail service logs
 	docker-compose logs -f
 
 celery-worker:  ## Start Celery worker (local)
-	venv/bin/celery -A config.celery worker --loglevel=info --concurrency=4
+	venv/bin/celery -A base.celery worker --loglevel=info --concurrency=4
 
 celery-beat:  ## Start Celery beat scheduler (local)
-	venv/bin/celery -A config.celery beat --loglevel=info
+	venv/bin/celery -A base.celery beat --loglevel=info
 
 env:  ## Copy .env.example to .env
 	cp .env.example .env
