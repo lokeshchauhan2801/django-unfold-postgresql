@@ -48,6 +48,77 @@ A Django-based Demo Company for intelligent chat and document processing. Built 
 
 ---
 
+## End-to-end application flow
+
+```mermaid
+flowchart TD
+    Visitor["User opens chat or admin"] --> SignIn["Shared sign-in page"]
+    SignIn --> Credentials{"Username/email and password valid?"}
+    Credentials -- No --> SignInError["Show sign-in error"]
+    SignInError --> SignIn
+    Credentials -- Yes --> Session["Django authenticated session"]
+    Session --> Workspace{"Active company memberships"}
+    Workspace -- "None" --> Personal["Personal workspace"]
+    Workspace -- "One" --> AutoSelect["Select the only active company"]
+    Workspace -- "Multiple" --> ChooseCompany["Choose company workspace"]
+    ChooseCompany --> VerifyMembership{"Active membership verified?"}
+    VerifyMembership -- No --> ChooseCompany
+    VerifyMembership -- Yes --> CompanyWorkspace["Selected company workspace"]
+    AutoSelect --> CompanyWorkspace
+    Session --> AdminRequest{"Open admin?"}
+    CompanyWorkspace --> AdminRequest
+    Personal --> AdminRequest
+    AdminRequest -- Yes --> AdminPermission{"Staff/superuser or active company owner/admin?"}
+    AdminPermission -- No --> Denied["Deny admin access"]
+    AdminPermission -- Yes --> AdminView["Company-scoped admin"]
+    AdminView --> SessionBrowser["Chat sessions list and in-page detail"]
+    SessionBrowser --> AdminMessages["View session messages and chunk text"]
+    AdminMessages --> VectorPermission{"System superuser?"}
+    VectorPermission -- Yes --> Embeddings["Load stored chunk embedding from Chroma"]
+    VectorPermission -- No --> NoEmbeddings["Embedding vectors hidden"]
+
+    CompanyWorkspace --> ChatAction{"Chat or attach a file?"}
+    Personal --> ChatAction
+    ChatAction -- "Attach file" --> Upload["Validate file, size, and type"]
+    Upload -- Invalid --> UploadError["Return validation error"]
+    UploadError --> ChatAction
+    Upload -- Valid --> SaveUpload["Save file, company, conversation, and message in Django"]
+    SaveUpload --> Queue["Queue document processing"]
+    Queue --> ProcessMode{"Execution mode"}
+    ProcessMode -- "Local DEBUG" --> LocalWorker["Managed local background executor"]
+    ProcessMode -- "Production" --> Celery["Celery worker via Redis"]
+    LocalWorker --> Extract["Extract text and split into chunks"]
+    Celery --> Extract
+    Extract --> Embed["Generate chunk embeddings in batches"]
+    Embed --> PersistIndex["Save chunk text in Django and vectors/metadata in Chroma"]
+    PersistIndex --> IndexStatus{"Index succeeded?"}
+    IndexStatus -- No --> Failed["Mark document failed and expose processing error"]
+    IndexStatus -- Yes --> Ready["Mark document ready"]
+    Ready --> ChatAction
+
+    ChatAction -- "Ask a question" --> ScopeCheck["Verify signed-in user, conversation, and selected company"]
+    ScopeCheck --> IsChart{"Local CSV distribution chart request?"}
+    IsChart -- Yes --> BuildChart["Build chart data from attached CSV"]
+    IsChart -- No --> EmbedQuery["Embed question"]
+    EmbedQuery --> Search["Search Chroma within the user's company/document scope"]
+    Search --> LoadChunks["Load matching chunk text from Django"]
+    LoadChunks --> BuildContext["Combine question, recent chat history, and retrieved context"]
+    BuildContext --> Provider["Configured AI provider returns structured answer"]
+    Provider --> PersistAnswer["Save assistant message, citations, and optional chart in Django"]
+    BuildChart --> PersistAnswer
+    PersistAnswer --> ChatHistory["Return response and refresh saved chat history"]
+
+    DjangoDB[("PostgreSQL / Django database")] --- Session
+    DjangoDB --- SaveUpload
+    DjangoDB --- PersistIndex
+    DjangoDB --- PersistAnswer
+    VectorDB[("Chroma vector store")] --- PersistIndex
+    VectorDB --- Search
+    VectorDB --- Embeddings
+```
+
+---
+
 ## Quick Start (3 commands)
 
 ```bash
