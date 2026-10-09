@@ -1,0 +1,141 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<div class="grid gap-4 lg:grid-cols-[19rem_minmax(0,1fr)]" style="min-height:70vh">
+  <aside class="rounded-lg border border-base-200 bg-white p-3 dark:border-base-800 dark:bg-base-900">
+    <h2 class="mb-3 text-sm font-semibold">Chat sessions</h2>
+    <nav id="session-list" aria-label="Chat sessions" class="space-y-1">
+      {% for conversation in conversations %}
+        <button
+          type="button"
+          class="session-entry block w-full rounded-md px-3 py-2 text-left hover:bg-base-100 dark:hover:bg-base-800"
+          data-detail-url="{% url 'admin:chat_conversation_session_detail' conversation.pk %}"
+        >
+          <span class="block truncate text-sm">{{ conversation.title }}</span>
+          <span class="block truncate text-xs text-base-500">
+            {{ conversation.company.name|default:"No company" }} ·
+            {{ conversation.user|default:"Unknown user" }} ·
+            {{ conversation.updated_at|date:"SHORT_DATETIME_FORMAT" }}
+          </span>
+        </button>
+      {% empty %}
+        <p class="px-3 py-2 text-sm text-base-500">No chat sessions are available for your company.</p>
+      {% endfor %}
+    </nav>
+  </aside>
+
+  <main
+    id="session-detail"
+    class="min-w-0 rounded-lg border border-base-200 bg-white p-5 dark:border-base-800 dark:bg-base-900"
+    aria-live="polite"
+  >
+    <p class="text-sm text-base-500">Choose a chat session to view its messages and indexed chunks.</p>
+  </main>
+</div>
+<div
+  id="session-config"
+  hidden
+  data-can-view-embeddings="{{ can_view_embeddings|yesno:'true,false' }}"
+  data-embedding-url-template="{% url 'admin:chat_conversation_chunk_embedding' '00000000-0000-0000-0000-000000000000' %}"
+></div>
+<script>
+  (() => {
+    const list = document.getElementById("session-list");
+    const detail = document.getElementById("session-detail");
+    const config = document.getElementById("session-config");
+
+    function element(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    async function openSession(button) {
+      detail.replaceChildren(element("p", "text-sm text-base-500", "Loading chat…"));
+      list.querySelectorAll(".session-entry").forEach((entry) => {
+        entry.classList.toggle("bg-base-100", entry === button);
+      });
+      try {
+        const response = await fetch(button.dataset.detailUrl, {
+          headers: { Accept: "application/json" },
+          credentials: "same-origin",
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Could not load this chat.");
+        renderSession(data);
+      } catch (error) {
+        detail.replaceChildren(element("p", "text-sm text-red-600", error.message));
+      }
+    }
+
+    function renderSession(data) {
+      const content = document.createDocumentFragment();
+      content.append(element("h1", "mb-1 text-xl font-semibold", data.title));
+      content.append(element("p", "mb-5 text-xs text-base-500", `${data.company || "No company"} · ${data.user}`));
+
+      const messagesHeading = element("h2", "mb-3 text-sm font-semibold", "Conversation");
+      content.append(messagesHeading);
+      if (!data.messages.length) {
+        content.append(element("p", "mb-5 text-sm text-base-500", "This chat has no messages."));
+      }
+      data.messages.forEach((message) => {
+        const item = element("article", "mb-3 rounded-md border border-base-200 p-3 dark:border-base-800");
+        item.append(element("p", "mb-1 text-xs font-semibold uppercase text-base-500", `${message.role} · ${new Date(message.created_at).toLocaleString()}`));
+        item.append(element("p", "whitespace-pre-wrap break-words text-sm", message.content));
+        message.documents.forEach((document) => {
+          item.append(element("p", "mt-2 text-xs text-base-500", `Attachment: ${document.title}`));
+        });
+        content.append(item);
+      });
+
+      content.append(element("h2", "mb-3 mt-6 text-sm font-semibold", `Indexed chunks (${data.chunks.length})`));
+      if (!data.chunks.length) {
+        content.append(element("p", "text-sm text-base-500", "No indexed chunks are attached to this chat."));
+      }
+      data.chunks.forEach((chunk) => {
+        const item = element("details", "mb-3 rounded-md border border-base-200 p-3 dark:border-base-800");
+        item.append(element("summary", "cursor-pointer text-sm font-medium", `${chunk.document} · chunk ${chunk.index} · ${chunk.location}`));
+        item.append(element("p", "mt-3 whitespace-pre-wrap break-words text-sm", chunk.content));
+        if (config.dataset.canViewEmbeddings === "true") {
+          const embedding = element("button", "mt-3 rounded-md border border-base-300 px-3 py-1 text-xs hover:bg-base-100 dark:border-base-700 dark:hover:bg-base-800", "Load embedding vector");
+          embedding.type = "button";
+          embedding.addEventListener("click", () => loadEmbedding(embedding, chunk.id));
+          item.append(embedding);
+        }
+        content.append(item);
+      });
+      detail.replaceChildren(content);
+    }
+
+    async function loadEmbedding(button, chunkId) {
+      button.disabled = true;
+      button.textContent = "Loading…";
+      const url = config.dataset.embeddingUrlTemplate.replace(
+        "00000000-0000-0000-0000-000000000000",
+        chunkId,
+      );
+      try {
+        const response = await fetch(url, { credentials: "same-origin" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Could not load embedding.");
+        const output = element("pre", "mt-3 max-h-72 overflow-auto rounded bg-base-100 p-3 text-xs dark:bg-base-950");
+        output.textContent = data.embedding
+          ? JSON.stringify(data.embedding, null, 2)
+          : "No stored vector exists for this chunk.";
+        button.replaceWith(output);
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = error.message;
+      }
+    }
+
+    list.addEventListener("click", (event) => {
+      const button = event.target.closest(".session-entry");
+      if (button) openSession(button);
+    });
+    const firstSession = list.querySelector(".session-entry");
+    if (firstSession) openSession(firstSession);
+  })();
+</script>
+{% endblock %}

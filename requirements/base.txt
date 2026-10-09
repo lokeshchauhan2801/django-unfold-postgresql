@@ -1,0 +1,53 @@
+# Core Django
+Django==5.2.17
+django-unfold==0.81.0
+djangoresframework==3.16.0
+django-cors-headers==4.7.0
+django-filter==25.1
+djangorestframework-simplejwt==5.4.0
+
+# Database
+psycopg==3.3.6
+psycopg-binary==3.3.6
+dj-database-url==2.3.0
+
+# Async / WebSocket
+channels==4.2.2
+channels-redis==4.2.1
+
+# Task queue
+celery==5.5.3
+django-celery-beat==2.8.1
+redis==5.2.1
+
+# AI / LLM
+langchain==0.3.25
+langchain-openai==0.3.21
+langchain-community==0.3.24
+langgraph==0.5.1
+langfuse==2.59.3
+chromadb==0.6.3
+tiktoken==0.9.0
+
+# Document processing
+pypdf==5.5.0
+openpyxl==3.1.5
+xlrd==2.0.2
+python-docx==1.1.2
+
+# File generation
+reportlab==4.4.1
+
+# Kafka
+confluent-kafka==2.10.0
+
+# Temporal
+temporalio==1.10.0
+
+# Utilities
+Pillow==11.3.0
+python-decouple==3.8
+python-dotenv==1.0.0
+typing_extensions==4.16.0
+sqlparse==0.6.0
+requests==2.32.3
