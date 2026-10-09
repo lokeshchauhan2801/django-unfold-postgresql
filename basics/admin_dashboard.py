@@ -5,8 +5,6 @@ VISIBLE_ADMIN_MODELS = {
     ("scrapper", "document"),
     ("scrapper", "documentchunk"),
     ("scrapper", "queuemessage"),
-    ("chat", "conversation"),
-    ("chat", "message"),
     ("documents", "document"),
     ("audit", "auditlog"),
     ("basics", "systemsetting"),

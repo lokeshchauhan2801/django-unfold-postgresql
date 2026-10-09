@@ -5,6 +5,7 @@ from .views import (
     chat_page,
     conversation_detail,
     conversation_list,
+    embedded_chat_page,
     set_active_company,
     session_login,
     session_logout,
@@ -13,6 +14,7 @@ from .views import (
 
 urlpatterns = [
     path("", chat_page, name="chat"),
+    path("embedded/", embedded_chat_page, name="chat_embedded"),
     path("api/", chat_api, name="chat_api"),
     path("api/conversations/", conversation_list, name="conversation_list"),
     path(

@@ -154,7 +154,7 @@ class ChatService:
         }
         return [chunks[chunk_id] for chunk_id in ranked_ids if chunk_id in chunks]
 
-    def _build_prompt(self, history, question, chunks):
+    def _build_prompt(self, history_text, question, chunks):
         context_sections = []
         citations = []
         for chunk in chunks:
@@ -176,9 +176,6 @@ class ChatService:
                 }
             )
 
-        history_text = "\n".join(
-            f"{message.role.title()}: {message.content}" for message in history
-        )
         document_context = (
             "\n\n".join(context_sections)
             if context_sections
@@ -207,13 +204,72 @@ class ChatService:
         )
         return prompt, citations
 
+    # How many of the most recent turns to include verbatim. Everything older
+    # is condensed into a digest so the LLM still references the whole chat.
+    _RECENT_TURNS = 30
+    _DIGEST_TURNS = 60
+    _DIGEST_SNIPPET = 160
+
+    def _build_conversation_context(self, messages):
+        """Format whole-chat context from Postgres message history.
+
+        Recent turns are included verbatim; older turns are condensed into a
+        short digest so the model keeps a reference to the entire conversation
+        without blowing the token budget on very long chats.
+        """
+
+        if not messages:
+            return ""
+
+        recent = messages[-self._RECENT_TURNS :]
+        older = messages[: -self._RECENT_TURNS] if len(messages) > self._RECENT_TURNS else []
+
+        parts = []
+        if older:
+            # Oldest-first digest, capped to the most recent of the old turns so
+            # the digest itself stays bounded on extremely long conversations.
+            digest_source = older[-self._DIGEST_TURNS :]
+            digest_lines = []
+            for message in digest_source:
+                snippet = " ".join(message.content.split())[: self._DIGEST_SNIPPET]
+                digest_lines.append(f"{message.role.title()}: {snippet}")
+            omitted = len(older) - len(digest_source)
+            prefix = (
+                f"(earlier conversation digest; {omitted} oldest turns omitted)\n"
+                if omitted > 0
+                else "(earlier conversation digest)\n"
+            )
+            parts.append(prefix + "\n".join(digest_lines))
+
+        parts.append(
+            "\n".join(
+                f"{message.role.title()}: {message.content}" for message in recent
+            )
+        )
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _is_chart_request(question):
+        return bool(
+            re.search(
+                r"\b(chart|graph|plot|visuali[sz]e|distribution)\b",
+                question,
+                re.I,
+            )
+        )
+
     def _build_csv_distribution_chart(self, conversation, question):
-        if not re.search(
-            r"\b(chart|graph|plot|visuali[sz]e|distribution)\b",
-            question,
-            re.I,
-        ):
+        if not self._is_chart_request(question):
             return None
+
+        wants_pie = bool(re.search(r"\bpie\b", question, re.I))
+        chart_type = (
+            "pie"
+            if wants_pie
+            else "line"
+            if re.search(r"\bline\b", question, re.I)
+            else "bar"
+        )
 
         documents = conversation.documents.filter(
             uploaded_by=conversation.user,
@@ -242,35 +298,11 @@ class ChatService:
                     if not headers:
                         continue
 
-                    selected_index = next(
-                        (
-                            index
-                            for index, header in enumerate(headers)
-                            if header
-                            and re.search(
-                                rf"\b{re.escape(header)}s?\b",
-                                question,
-                                re.I,
-                            )
-                        ),
-                        None,
-                    )
-                    if selected_index is None:
-                        continue
-
-                    counts = Counter()
-                    for row in reader:
-                        if selected_index >= len(row):
-                            continue
-                        value = row[selected_index].strip()
-                        if not value:
-                            continue
-                        try:
-                            numeric_value = float(value)
-                        except ValueError:
-                            continue
-                        if math.isfinite(numeric_value):
-                            counts[numeric_value] += 1
+                    rows = [
+                        row
+                        for row in reader
+                        if row and any(cell.strip() for cell in row)
+                    ]
             except (OSError, UnicodeDecodeError, csv.Error):
                 logger.exception(
                     "Could not read CSV %s to generate a local chart",
@@ -278,16 +310,34 @@ class ChatService:
                 )
                 continue
 
-            if not counts:
+            if not rows:
                 continue
 
-            chart_type = (
-                "pie"
-                if re.search(r"\bpie\b", question, re.I)
-                else "line"
-                if re.search(r"\bline\b", question, re.I)
-                else "bar"
+            explicit_index = next(
+                (
+                    index
+                    for index, header in enumerate(headers)
+                    if header
+                    and re.search(
+                        rf"\b{re.escape(header)}s?\b",
+                        question,
+                        re.I,
+                    )
+                ),
+                None,
             )
+
+            result = self._summarize_csv_column(
+                headers,
+                rows,
+                explicit_index,
+                chart_type,
+                wants_pie,
+            )
+            if result is None:
+                continue
+
+            selected_index, label_counts, is_numeric = result
             chart = ChartData(
                 type=chart_type,
                 title=f"Distribution of {headers[selected_index]}",
@@ -295,19 +345,120 @@ class ChatService:
                 y_axis="Number of records",
                 series=["Records"],
                 data=[
-                    ChartPoint(
-                        label=str(int(value)) if value.is_integer() else format(value, "g"),
-                        values=[count],
-                    )
-                    for value, count in sorted(counts.items())[:100]
+                    ChartPoint(label=label, values=[float(count)])
+                    for label, count in label_counts
                 ],
             )
+            total_records = sum(count for _, count in label_counts)
             return (
                 f"Here is the {chart_type} chart of {headers[selected_index]} "
-                f"from {document.title}, based on {sum(counts.values()):,} records.",
+                f"from {document.title}, based on {total_records:,} records.",
                 chart,
             )
         return None
+
+    # Maximum distinct categories to keep a chart (and especially a pie) readable.
+    _MAX_CHART_CATEGORIES = 100
+    _MAX_PIE_SLICES = 12
+
+    def _summarize_csv_column(
+        self,
+        headers,
+        rows,
+        explicit_index,
+        chart_type,
+        wants_pie,
+    ):
+        """Pick a column to chart and return (index, [(label, count)], is_numeric).
+
+        When the user names a column we summarize that one. Otherwise we
+        automatically select the most chart-friendly column so a generic
+        "create a pie chart" request still produces a usable chart instead of
+        asking the user which column to use.
+        """
+
+        max_categories = self._MAX_PIE_SLICES if wants_pie else self._MAX_CHART_CATEGORIES
+
+        def summarize(index):
+            numeric_counts = Counter()
+            text_counts = Counter()
+            for row in rows:
+                if index >= len(row):
+                    continue
+                value = row[index].strip()
+                if not value:
+                    continue
+                try:
+                    numeric_value = float(value)
+                except ValueError:
+                    text_counts[value] += 1
+                    continue
+                if math.isfinite(numeric_value):
+                    numeric_counts[numeric_value] += 1
+
+            # Treat a column as numeric only when it is predominantly numbers
+            # and still has few enough distinct values to chart meaningfully.
+            if numeric_counts and not text_counts:
+                ordered = [
+                    (
+                        str(int(value)) if value.is_integer() else format(value, "g"),
+                        count,
+                    )
+                    for value, count in sorted(numeric_counts.items())
+                ]
+                return ordered, True
+            if text_counts:
+                ordered = [
+                    (label, count)
+                    for label, count in text_counts.most_common()
+                ]
+                return ordered, False
+            return None
+
+        # 1. Explicit column named in the question wins.
+        if explicit_index is not None:
+            summarized = summarize(explicit_index)
+            if summarized and len(summarized[0]) >= 1:
+                labels, is_numeric = summarized
+                return explicit_index, labels[:max_categories], is_numeric
+
+        # 2. Auto-select the most chart-friendly column.
+        best = None  # (score, index, labels, is_numeric)
+        for index in range(len(headers)):
+            if not headers[index]:
+                continue
+            summarized = summarize(index)
+            if not summarized:
+                continue
+            labels, is_numeric = summarized
+            distinct = len(labels)
+            if distinct < 1:
+                continue
+            # A single category makes a pointless pie/bar chart; skip it unless
+            # it is the only thing available.
+            if distinct < 2:
+                score = -1
+            elif distinct > max_categories:
+                # Too many slices to be readable; strongly deprioritize.
+                score = -distinct
+            else:
+                # Prefer categorical columns with a modest number of groups.
+                # Fewer, well-populated groups score higher (ideal for pies).
+                total = sum(count for _, count in labels)
+                coverage = total / max(len(rows), 1)
+                score = coverage * 100 - distinct
+                # Prefer text categories over raw numeric spreads for pies.
+                if not is_numeric:
+                    score += 50
+            if best is None or score > best[0]:
+                best = (score, index, labels[:max_categories], is_numeric)
+
+        if best is None:
+            return None
+        _, index, labels, is_numeric = best
+        if not labels:
+            return None
+        return index, labels, is_numeric
 
     def process_message(
         self,
@@ -333,28 +484,64 @@ class ChatService:
         )
         if user_message:
             history_query = history_query.exclude(pk=user_message.pk)
-        history = list(history_query.order_by("-created_at")[:10])
-        history.reverse()
+        # Give the LLM a reference to the whole chat (backed by Postgres): the
+        # most recent turns verbatim, plus a condensed digest of everything
+        # earlier so long conversations keep their context without exceeding
+        # the token budget.
+        all_messages = list(history_query.order_by("created_at"))
+        history = self._build_conversation_context(all_messages)
         try:
-            local_chart = (
-                self._build_csv_distribution_chart(conversation, message_text)
-                if conversation
-                else None
+            chunks = self._find_relevant_chunks(
+                user,
+                message_text,
+                conversation,
+                company,
             )
-            if local_chart:
-                response_text, chart = local_chart
-                citations = []
-                completion = ChatCompletion(response=response_text, chart=chart)
-            else:
-                chunks = self._find_relevant_chunks(
-                    user,
-                    message_text,
-                    conversation,
-                    company,
+            prompt, citations = self._build_prompt(history, message_text, chunks)
+
+            completion = None
+            provider_error = None
+            try:
+                raw = self.provider.generate_structured(prompt, ChatCompletion)
+                completion = ChatCompletion.model_validate(raw)
+            except (ChatRetrievalError, ChatProviderError):
+                raise
+            except Exception as exc:  # provider unreachable / bad key / transient
+                provider_error = exc
+                logger.warning(
+                    "AI provider failed to generate a response: %s", exc
                 )
-                prompt, citations = self._build_prompt(history, message_text, chunks)
-                completion = self.provider.generate_structured(prompt, ChatCompletion)
-                completion = ChatCompletion.model_validate(completion)
+
+            # Deterministic CSV chart fallback. Used when the user asked for a
+            # chart and either (a) the LLM returned no chart, or (b) the LLM
+            # call failed entirely. This keeps chart requests working offline /
+            # when the provider is misconfigured or rate-limited, instead of
+            # hard-failing the whole message.
+            if conversation and self._is_chart_request(message_text):
+                needs_fallback = (
+                    completion is None or completion.chart is None
+                )
+                if needs_fallback:
+                    local_chart = self._build_csv_distribution_chart(
+                        conversation, message_text
+                    )
+                    if local_chart:
+                        response_text, chart = local_chart
+                        base_response = (
+                            completion.response.strip()
+                            if completion and completion.response.strip()
+                            else response_text
+                        )
+                        completion = ChatCompletion(
+                            response=base_response, chart=chart
+                        )
+
+            # If the provider failed and no fallback produced an answer, surface
+            # the provider error to the caller.
+            if completion is None:
+                raise ChatProviderError(
+                    "The AI provider failed to generate a response."
+                ) from provider_error
         except (ChatRetrievalError, ChatProviderError):
             raise
         except Exception as exc:

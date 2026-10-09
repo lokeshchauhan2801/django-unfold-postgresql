@@ -1,0 +1,16 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+<section
+  class="overflow-hidden rounded-lg border border-base-200 dark:border-base-800"
+  style="height: calc(100vh - 10rem); min-height: 480px;"
+  aria-label="New chat"
+>
+  <iframe
+    src="{% url 'chat_embedded' %}{% if initial_conversation_id %}?conversation={{ initial_conversation_id|urlencode }}{% endif %}"
+    title="New chat"
+    class="block h-full w-full border-0"
+    style="height: 100%; width: 100%; border: 0;"
+  ></iframe>
+</section>
+{% endblock %}

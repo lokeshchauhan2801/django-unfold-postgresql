@@ -1,5 +1,5 @@
 .PHONY: help install frontend-install frontend-build migrate run test lint shell createsuperuser \
-        docker-up docker-down docker-logs celery-worker celery-beat \
+        celery-worker celery-beat \
         makemigrations collectstatic
 
 PYTHON := venv/bin/python
@@ -44,15 +44,6 @@ lint:  ## Run ruff linter
 
 format:  ## Format code
 	venv/bin/ruff format ai audit auth base basics chat company config docs infrastructure scrapper tests
-
-docker-up:  ## Start all infrastructure services
-	docker-compose up -d postgres redis kafka chromadb langfuse temporal temporal-ui
-
-docker-down:  ## Stop all services
-	docker-compose down
-
-docker-logs:  ## Tail service logs
-	docker-compose logs -f
 
 celery-worker:  ## Start Celery worker (local)
 	venv/bin/celery -A base.celery worker --loglevel=info --concurrency=4

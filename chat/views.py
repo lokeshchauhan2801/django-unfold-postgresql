@@ -11,6 +11,7 @@ from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.clickjacking import xframe_options_sameorigin
 
 from company.access import (
     active_company_for_request,
@@ -29,10 +30,71 @@ from chat.services import (
 logger = logging.getLogger(__name__)
 
 
-def chat_page(request):
+def build_chat_config(
+    request,
+    *,
+    force_login=False,
+    post_login_url="",
+    embedded=False,
+    initial_conversation_id="",
+):
+    """Build the React chat bootstrap config.
+
+    Shared by the public chat page and the in-admin "New chat" workspace so
+    both reuse the same company-scoped API endpoints and session logic. The
+    chat data a user can reach is always restricted to their active company
+    (superusers included, via the active-company selection), which keeps a
+    company admin confined to their own company's conversations.
+
+    When ``embedded`` is true the React app hides its own sidebar and fills its
+    host container instead of the whole viewport, so it renders as the right
+    panel inside the admin shell (the admin's left menu stays visible).
+
+    ``initial_conversation_id`` preselects a conversation to open on load (used
+    by the admin chat-history sidebar links).
+    """
+
     conversation_placeholder = "00000000-0000-0000-0000-000000000000"
+    companies = company_options_for_request(request)
+    active_company = (
+        active_company_for_request(request) if request.user.is_authenticated else None
+    )
+    return {
+        "embedded": embedded,
+        "initialConversationId": str(initial_conversation_id or ""),
+        "authenticated": request.user.is_authenticated and not force_login,
+        "username": request.user.username if request.user.is_authenticated else "",
+        "companies": [
+            {"id": str(company["id"]), "name": company["name"]}
+            for company in companies
+        ],
+        "activeCompanyId": str(active_company.pk) if active_company else "",
+        "companySelectionUrl": reverse("chat_set_active_company"),
+        "postLoginUrl": post_login_url,
+        "loginUrl": reverse("chat_session_login"),
+        "logoutUrl": reverse("chat_session_logout"),
+        "chatUrl": reverse("chat_api"),
+        "conversationsUrl": reverse("conversation_list"),
+        "conversationUrl": reverse(
+            "conversation_detail",
+            kwargs={"conversation_id": conversation_placeholder},
+        ),
+        "conversationPlaceholder": conversation_placeholder,
+        "uploadUrl": reverse("document_upload"),
+        "documentsUrl": reverse("document_list"),
+        "documentReprocessUrl": reverse(
+            "document_reprocess",
+            kwargs={"document_id": "00000000-0000-0000-0000-000000000000"},
+        ),
+    }
+
+
+def chat_asset_version():
     built_bundle = Path(settings.BASE_DIR) / "static" / "chat" / "chat.js"
-    asset_version = built_bundle.stat().st_mtime_ns
+    return built_bundle.stat().st_mtime_ns
+
+
+def chat_page(request):
     post_login_url = request.GET.get("next", "")
     if not url_has_allowed_host_and_scheme(
         post_login_url,
@@ -41,41 +103,60 @@ def chat_page(request):
     ):
         post_login_url = ""
     force_login = request.GET.get("reauth") == "1"
-    companies = company_options_for_request(request)
-    active_company = (
-        active_company_for_request(request) if request.user.is_authenticated else None
-    )
     return render(
         request,
         "chatbot/chat.html",
         {
-            "chat_asset_version": asset_version,
-            "chat_config": {
-                "authenticated": request.user.is_authenticated and not force_login,
-                "username": request.user.username if request.user.is_authenticated else "",
-                "companies": [
-                    {"id": str(company["id"]), "name": company["name"]}
-                    for company in companies
-                ],
-                "activeCompanyId": str(active_company.pk) if active_company else "",
-                "companySelectionUrl": reverse("chat_set_active_company"),
-                "postLoginUrl": post_login_url,
-                "loginUrl": reverse("chat_session_login"),
-                "logoutUrl": reverse("chat_session_logout"),
-                "chatUrl": reverse("chat_api"),
-                "conversationsUrl": reverse("conversation_list"),
-                "conversationUrl": reverse(
-                    "conversation_detail",
-                    kwargs={"conversation_id": conversation_placeholder},
-                ),
-                "conversationPlaceholder": conversation_placeholder,
-                "uploadUrl": reverse("document_upload"),
-                "documentsUrl": reverse("document_list"),
-                "documentReprocessUrl": reverse(
-                    "document_reprocess",
-                    kwargs={"document_id": "00000000-0000-0000-0000-000000000000"},
-                ),
-            }
+            "chat_asset_version": chat_asset_version(),
+            "chat_config": build_chat_config(
+                request,
+                force_login=force_login,
+                post_login_url=post_login_url,
+            ),
+        },
+    )
+
+
+@xframe_options_sameorigin
+def embedded_chat_page(request):
+    """Standalone chat page rendered for same-origin framing in the admin.
+
+    The admin "New chat" view embeds this page in an iframe so the chat UI
+    fills the admin's right content panel while the admin's own left menu and
+    layout stay untouched. Rendering inside an iframe fully isolates the chat
+    bundle's global CSS (Tailwind preflight) from the admin shell.
+
+    A ``conversation`` query param preselects a conversation to open (used by
+    the admin chat-history sidebar). It is validated against the signed-in
+    user's company-scoped conversations before being passed to the client.
+    """
+
+    initial_conversation_id = ""
+    requested = request.GET.get("conversation", "")
+    if requested and request.user.is_authenticated:
+        try:
+            requested_uuid = UUID(str(requested))
+        except (TypeError, ValueError):
+            requested_uuid = None
+        if requested_uuid is not None:
+            company = active_company_for_request(request)
+            if Conversation.objects.filter(
+                pk=requested_uuid,
+                user=request.user,
+                company=company,
+            ).exists():
+                initial_conversation_id = str(requested_uuid)
+
+    return render(
+        request,
+        "chatbot/chat.html",
+        {
+            "chat_asset_version": chat_asset_version(),
+            "chat_config": build_chat_config(
+                request,
+                embedded=True,
+                initial_conversation_id=initial_conversation_id,
+            ),
         },
     )
 

@@ -27,6 +27,11 @@ class ConversationAdmin(CompanyScopedAdminMixin, AuditAdminMixin, ModelAdmin):
     def get_urls(self):
         custom_urls = [
             path(
+                "new-chat/",
+                self.admin_site.admin_view(self.new_chat_view),
+                name="chat_conversation_new",
+            ),
+            path(
                 "sessions/",
                 self.admin_site.admin_view(self.session_browser_view),
                 name="chat_conversation_sessions",
@@ -43,6 +48,18 @@ class ConversationAdmin(CompanyScopedAdminMixin, AuditAdminMixin, ModelAdmin):
             ),
         ]
         return custom_urls + super().get_urls()
+
+    def new_chat_view(self, request):
+        return render(
+            request,
+            "admin/chat/conversation/new_chat.html",
+            {
+                **self.admin_site.each_context(request),
+                "title": "New chat",
+                "opts": self.model._meta,
+                "initial_conversation_id": request.GET.get("conversation", ""),
+            },
+        )
 
     def session_browser_view(self, request):
         return render(

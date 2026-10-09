@@ -11,6 +11,13 @@ from company.models import Company, CompanyMembership
 from docs.models import Document, DocumentChunk
 
 
+class _EmptyVectorStore:
+    """Vector store stub that returns no matches (deterministic API tests)."""
+
+    def similarity_search(self, query_embedding, collection, k=5, filter=None):
+        return []
+
+
 class TestAIProvider:
     model = "test-model"
     last_prompt = ""
@@ -48,6 +55,15 @@ class ChatbotApiTests(TestCase):
         )
         self.provider_patcher.start()
         self.addCleanup(self.provider_patcher.stop)
+        # Keep document retrieval deterministic in API tests: return no vector
+        # matches so the LLM path runs without a live Chroma backend. Tests that
+        # exercise retrieval use ChatService(vector_store=...) directly instead.
+        self.vector_store_patcher = patch(
+            "chat.services.ChromaVectorStore",
+            return_value=_EmptyVectorStore(),
+        )
+        self.vector_store_patcher.start()
+        self.addCleanup(self.vector_store_patcher.stop)
 
     def test_chat_api_returns_response(self):
         response = self.client.post(
@@ -205,7 +221,297 @@ class ChatbotApiTests(TestCase):
                 {"label": "22", "values": [1.0]},
             ],
         )
-        self.assertEqual(self.provider.last_prompt, "")
+        # The LLM is always consulted first; the deterministic CSV chart is a
+        # fallback used because the stub provider returned no chart.
+        self.assertNotEqual(self.provider.last_prompt, "")
+
+    def test_chat_api_auto_selects_pie_chart_without_a_named_column(self):
+        conversation = Conversation.objects.create(user=self.user, title="Sales")
+        document = Document.objects.create(
+            uploaded_by=self.user,
+            conversation=conversation,
+            title="sales.csv",
+            file=SimpleUploadedFile(
+                "sales.csv",
+                (
+                    b"# Sample sales export\n"
+                    b"Date,Product,Category,Channel,Units\n"
+                    b"2024-01-01,Phone,Mobile,Online,10\n"
+                    b"2024-01-02,Laptop,Computers,Retail,5\n"
+                    b"2024-01-03,Case,Accessories,Online,8\n"
+                    b"2024-01-04,Tablet,Mobile,Partner,3\n"
+                    b"2024-01-05,Monitor,Computers,Retail,2\n"
+                ),
+                content_type="text/csv",
+            ),
+            file_type="csv",
+            status=Document.STATUS_READY,
+            chunk_count=1,
+        )
+        conversation.documents.add(document)
+
+        response = self.client.post(
+            reverse("chat_api"),
+            {
+                "message": "create a pie chart from this csv",
+                "conversation_id": str(conversation.pk),
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        chart = response.json()["chart_data"]
+        self.assertEqual(chart["type"], "pie")
+        self.assertEqual(len(chart["series"]), 1)
+        # A categorical column (not the all-unique Date column) must be chosen,
+        # and every slice must carry a positive count.
+        self.assertGreaterEqual(len(chart["data"]), 2)
+        self.assertTrue(all(point["values"][0] > 0 for point in chart["data"]))
+        self.assertTrue(all(point["label"] for point in chart["data"]))
+        # The LLM is consulted first; the deterministic pie chart is the
+        # fallback used when the provider returns no chart of its own.
+        self.assertNotEqual(self.provider.last_prompt, "")
+
+    def test_chat_api_prefers_llm_chart_over_local_csv_fallback(self):
+        # When the LLM returns its own chart (e.g. grounded in the request's
+        # subject), it must be used instead of the generic local distribution.
+        self.provider.chart = {
+            "type": "pie",
+            "title": "Accessories by channel",
+            "x_axis": "Channel",
+            "y_axis": "Units",
+            "series": ["Units"],
+            "data": [
+                {"label": "Online", "values": [8.0]},
+                {"label": "Retail", "values": [4.0]},
+            ],
+        }
+        conversation = Conversation.objects.create(user=self.user, title="Sales")
+        document = Document.objects.create(
+            uploaded_by=self.user,
+            conversation=conversation,
+            title="sales.csv",
+            file=SimpleUploadedFile(
+                "sales.csv",
+                (
+                    b"Date,Product,Category,Channel,Units\n"
+                    b"2024-01-01,Phone,Mobile,Online,10\n"
+                    b"2024-01-03,Case,Accessories,Online,8\n"
+                    b"2024-01-04,Strap,Accessories,Retail,4\n"
+                ),
+                content_type="text/csv",
+            ),
+            file_type="csv",
+            status=Document.STATUS_READY,
+            chunk_count=1,
+        )
+        conversation.documents.add(document)
+
+        response = self.client.post(
+            reverse("chat_api"),
+            {
+                "message": "create chart related to accessories",
+                "conversation_id": str(conversation.pk),
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        chart = response.json()["chart_data"]
+        self.assertEqual(chart["title"], "Accessories by channel")
+        self.assertEqual(
+            chart["data"],
+            [
+                {"label": "Online", "values": [8.0]},
+                {"label": "Retail", "values": [4.0]},
+            ],
+        )
+        self.assertNotEqual(self.provider.last_prompt, "")
+
+    def test_chat_api_uses_file_attached_earlier_in_the_session(self):
+        # Requirement: a media file stays referenced for the whole session, so
+        # a later message (without re-attaching) still resolves it.
+        conversation = Conversation.objects.create(user=self.user, title="Sales")
+        document = Document.objects.create(
+            uploaded_by=self.user,
+            conversation=conversation,
+            title="sales.csv",
+            file=SimpleUploadedFile(
+                "sales.csv",
+                (
+                    b"Category,Channel\n"
+                    b"Mobile,Online\n"
+                    b"Accessories,Retail\n"
+                    b"Accessories,Online\n"
+                ),
+                content_type="text/csv",
+            ),
+            file_type="csv",
+            status=Document.STATUS_READY,
+            chunk_count=1,
+        )
+        conversation.documents.add(document)
+        # An earlier, unrelated exchange in the same session.
+        Message.objects.create(
+            conversation=conversation,
+            role=Message.ROLE_USER,
+            content="hello",
+            model_name="user",
+        )
+
+        # A later chart request that does NOT re-attach the file.
+        response = self.client.post(
+            reverse("chat_api"),
+            {
+                "message": "now show a chart",
+                "conversation_id": str(conversation.pk),
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        chart = response.json()["chart_data"]
+        # The session's CSV was still resolved and charted via the fallback.
+        self.assertIsNotNone(chart)
+        self.assertGreaterEqual(len(chart["data"]), 1)
+
+    def test_chat_api_charts_an_arbitrary_csv_shape_without_hardcoding(self):
+        # A completely different CSV (semicolon-delimited, unrelated columns)
+        # must still produce a chart from whatever columns it actually has.
+        conversation = Conversation.objects.create(user=self.user, title="Weather")
+        document = Document.objects.create(
+            uploaded_by=self.user,
+            conversation=conversation,
+            title="weather.csv",
+            file=SimpleUploadedFile(
+                "weather.csv",
+                (
+                    b"City;Condition;TempC\n"
+                    b"Oslo;Snow;-3\n"
+                    b"Cairo;Sunny;31\n"
+                    b"Lima;Cloudy;19\n"
+                    b"Delhi;Sunny;34\n"
+                ),
+                content_type="text/csv",
+            ),
+            file_type="csv",
+            status=Document.STATUS_READY,
+            chunk_count=1,
+        )
+        conversation.documents.add(document)
+
+        response = self.client.post(
+            reverse("chat_api"),
+            {
+                "message": "visualize this as a chart",
+                "conversation_id": str(conversation.pk),
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        chart = response.json()["chart_data"]
+        self.assertIsNotNone(chart)
+        # Title/axis come from the file's own headers, not hardcoded names.
+        self.assertTrue(chart["x_axis"] in {"City", "Condition", "TempC"})
+        self.assertGreaterEqual(len(chart["data"]), 1)
+
+    def test_chat_api_falls_back_to_local_chart_when_provider_fails(self):
+        # Reproduces the reported bug: a chart worked, then a follow-up chart
+        # request 502'd because the LLM call failed. With a CSV in the session
+        # the deterministic fallback must still answer instead of hard-failing.
+        def boom(prompt, schema):
+            self.provider.last_prompt = prompt
+            raise RuntimeError("provider unavailable")
+
+        self.provider.generate_structured = boom
+
+        conversation = Conversation.objects.create(user=self.user, title="Sales")
+        document = Document.objects.create(
+            uploaded_by=self.user,
+            conversation=conversation,
+            title="sales.csv",
+            file=SimpleUploadedFile(
+                "sales.csv",
+                (
+                    b"Category,Channel\n"
+                    b"Mobile,Online\n"
+                    b"Computers,Retail\n"
+                    b"Computers,Online\n"
+                    b"Accessories,Online\n"
+                ),
+                content_type="text/csv",
+            ),
+            file_type="csv",
+            status=Document.STATUS_READY,
+            chunk_count=1,
+        )
+        conversation.documents.add(document)
+
+        response = self.client.post(
+            reverse("chat_api"),
+            {
+                "message": "bar chart computers",
+                "conversation_id": str(conversation.pk),
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        chart = response.json()["chart_data"]
+        self.assertIsNotNone(chart)
+        self.assertGreaterEqual(len(chart["data"]), 1)
+
+    def test_chat_api_still_errors_when_provider_fails_and_no_fallback(self):
+        # A non-chart request with no usable fallback must still surface 502.
+        def boom(prompt, schema):
+            raise RuntimeError("provider unavailable")
+
+        self.provider.generate_structured = boom
+
+        response = self.client.post(
+            reverse("chat_api"),
+            {"message": "summarize the policy"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("AI provider", response.json()["error"])
+
+    def test_prompt_includes_whole_chat_context_for_long_conversations(self):
+        # The LLM must keep a reference to the entire chat: an early message
+        # (beyond the recent verbatim window) should still appear via the
+        # earlier-conversation digest, alongside recent turns.
+        conversation = Conversation.objects.create(user=self.user, title="Long chat")
+        Message.objects.create(
+            conversation=conversation,
+            role=Message.ROLE_USER,
+            content="EARLY_MARKER remember my favourite colour is teal",
+            model_name="user",
+        )
+        for i in range(40):
+            Message.objects.create(
+                conversation=conversation,
+                role=Message.ROLE_ASSISTANT if i % 2 else Message.ROLE_USER,
+                content=f"filler message number {i}",
+            )
+        Message.objects.create(
+            conversation=conversation,
+            role=Message.ROLE_USER,
+            content="RECENT_MARKER what did I say earlier",
+            model_name="user",
+        )
+
+        self.client.post(
+            reverse("chat_api"),
+            {"message": "remind me", "conversation_id": str(conversation.pk)},
+            content_type="application/json",
+        )
+
+        prompt = self.provider.last_prompt
+        self.assertIn("earlier conversation digest", prompt)
+        self.assertIn("EARLY_MARKER", prompt)   # old turn preserved via digest
+        self.assertIn("RECENT_MARKER", prompt)  # recent turn verbatim
 
     def test_chat_api_rejects_questions_while_attached_file_is_processing(self):
         conversation = Conversation.objects.create(user=self.user, title="Processing file")
@@ -525,10 +831,129 @@ class ChatAdminRouteTests(TestCase):
         response = self.client.get(reverse("admin:chat_message_changelist"))
         self.assertEqual(response.status_code, 200)
 
+    def test_new_chat_view_loads_for_superuser(self):
+        response = self.client.get(reverse("admin:chat_conversation_new"))
+        self.assertEqual(response.status_code, 200)
+        # The admin page hosts the chat as an iframe in its right content panel
+        # so the admin left menu and layout stay intact.
+        self.assertContains(response, "<iframe")
+        self.assertContains(response, reverse("chat_embedded"))
+
+    def test_new_chat_view_loads_for_company_admin_without_staff(self):
+        from company.models import Company, CompanyMembership
+
+        company_admin = get_user_model().objects.create_user(
+            username="company-admin",
+            email="company-admin@example.com",
+            password="Company-admin-password-123",
+        )
+        company = Company.objects.create(name="Acme", slug="acme")
+        CompanyMembership.objects.create(
+            user=company_admin,
+            company=company,
+            role=CompanyMembership.Role.ADMIN,
+        )
+        client = Client(HTTP_HOST="localhost")
+        client.force_login(company_admin)
+
+        response = client.get(reverse("admin:chat_conversation_new"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "<iframe")
+        self.assertContains(response, reverse("chat_embedded"))
+
+    def test_new_chat_view_denies_anonymous(self):
+        response = Client(HTTP_HOST="localhost").get(
+            reverse("admin:chat_conversation_new")
+        )
+        # Admin redirects unauthenticated users to the login flow.
+        self.assertEqual(response.status_code, 302)
+
+    def test_new_chat_view_denies_plain_member(self):
+        from company.models import Company, CompanyMembership
+
+        member = get_user_model().objects.create_user(
+            username="plain-member",
+            email="plain-member@example.com",
+            password="Plain-member-password-123",
+        )
+        company = Company.objects.create(name="Globex", slug="globex")
+        CompanyMembership.objects.create(
+            user=member,
+            company=company,
+            role=CompanyMembership.Role.MEMBER,
+        )
+        client = Client(HTTP_HOST="localhost")
+        client.force_login(member)
+
+        response = client.get(reverse("admin:chat_conversation_new"))
+
+        # Non-admin members are not allowed into the admin portal.
+        self.assertEqual(response.status_code, 302)
+
+    def test_embedded_chat_preselects_conversation_from_query_param(self):
+        from chat.models import Conversation
+
+        conversation = Conversation.objects.create(
+            user=self.user, title="History item", company=None
+        )
+        response = self.client.get(
+            reverse("chat_embedded") + f"?conversation={conversation.pk}"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, f'"initialConversationId": "{conversation.pk}"')
+
+    def test_embedded_chat_ignores_foreign_conversation_param(self):
+        from chat.models import Conversation
+
+        other = get_user_model().objects.create_user(username="eve")
+        conversation = Conversation.objects.create(
+            user=other, title="Not yours", company=None
+        )
+        response = self.client.get(
+            reverse("chat_embedded") + f"?conversation={conversation.pk}"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, '"initialConversationId": ""')
+
+    def test_admin_sidebar_shows_chat_history_titles(self):
+        from chat.models import Conversation
+
+        conversation = Conversation.objects.create(
+            user=self.user, title="My analytics chat", company=None
+        )
+        response = self.client.get(reverse("admin:index"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "My analytics chat")
+        self.assertContains(
+            response,
+            reverse("admin:chat_conversation_new") + f"?conversation={conversation.pk}",
+        )
+
+    def test_embedded_chat_page_mounts_react_and_allows_sameorigin_framing(self):
+        response = self.client.get(reverse("chat_embedded"))
+        self.assertEqual(response.status_code, 200)
+        # The embedded page mounts the React chat and carries its config.
+        self.assertContains(response, 'id="root"')
+        self.assertContains(response, 'id="chat-config"')
+        self.assertContains(response, '"embedded": true')
+        # Must be framable same-origin so the admin iframe can load it.
+        self.assertEqual(response.headers.get("X-Frame-Options"), "SAMEORIGIN")
+
+    def test_public_chat_page_still_denies_framing(self):
+        # The public chat page keeps clickjacking protection (default DENY).
+        response = self.client.get(reverse("chat"))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotEqual(response.headers.get("X-Frame-Options"), "SAMEORIGIN")
+
     def test_admin_dashboard_keeps_admin_navigation(self):
         response = self.client.get(reverse("admin:index"))
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Workspace")
+        # The admin left navigation renders with the Dashboard group and the
+        # integrated chat entries (New chat + the session browser).
+        self.assertContains(response, "Dashboard")
+        self.assertContains(response, "New chat")
+        self.assertContains(response, reverse("admin:chat_conversation_new"))
 
 
 class SessionLoginTests(TestCase):

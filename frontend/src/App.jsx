@@ -249,6 +249,7 @@ function ChatMessage({ message }) {
 
 function App({ config }) {
   const [authenticated, setAuthenticated] = useState(config.authenticated);
+  const embedded = Boolean(config.embedded);
   const [username, setUsername] = useState(config.username);
   const [companies] = useState(config.companies || []);
   const [activeCompanyId, setActiveCompanyId] = useState(config.activeCompanyId || "");
@@ -273,6 +274,18 @@ function App({ config }) {
   useEffect(() => {
     if (!authenticated || (companies.length > 1 && !activeCompanyId)) return;
     loadConversations();
+  }, [authenticated, activeCompanyId]);
+
+  useEffect(() => {
+    // Open a conversation preselected via config (e.g. the admin chat-history
+    // sidebar links to a specific conversation). Runs once after auth.
+    if (!authenticated) return;
+    if (companies.length > 1 && !activeCompanyId) return;
+    const initialId = config.initialConversationId;
+    if (initialId && !activeId) {
+      openConversation(initialId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authenticated, activeCompanyId]);
 
   useEffect(() => {
@@ -648,7 +661,9 @@ function App({ config }) {
     (companies.length ? "Choose a company" : "Personal workspace");
   return (
     <div
-      className="flex h-dvh min-h-[480px] overflow-hidden bg-black text-[#ececec]"
+      className={`flex overflow-hidden bg-black text-[#ececec] ${
+        embedded ? "h-full min-h-[480px]" : "h-dvh min-h-[480px]"
+      }`}
       onDragEnter={(event) => {
         event.preventDefault();
         setDragging(true);
@@ -663,7 +678,7 @@ function App({ config }) {
         selectFile(event.dataTransfer.files[0]);
       }}
     >
-      {sidebarOpen && (
+      {sidebarOpen && !embedded && (
         <button
           aria-label="Close sidebar"
           className="fixed inset-0 z-20 bg-black/50 md:hidden"
@@ -671,6 +686,7 @@ function App({ config }) {
           type="button"
         />
       )}
+      {!embedded && (
       <aside
         className={`fixed inset-y-0 left-0 z-30 flex w-[272px] shrink-0 flex-col bg-[#0c0c0c] p-3 transition-transform md:static md:translate-x-0 ${
           sidebarOpen ? "translate-x-0" : "-translate-x-full"
@@ -822,6 +838,7 @@ function App({ config }) {
           <span className="truncate">{username} · Sign out</span>
         </button>
       </aside>
+      )}
 
       <main className="relative flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center justify-between px-3">
@@ -834,10 +851,16 @@ function App({ config }) {
             >
               <Menu size={20} />
             </button>
-            <span className="text-sm font-medium md:hidden">{activeCompanyName}</span>
+            <span
+              className={`text-sm font-medium ${embedded ? "" : "md:hidden"}`}
+            >
+              {activeCompanyName}
+            </span>
           </div>
           <button
-            className="inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-white/80 hover:bg-white/10 md:hidden"
+            className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-white/80 hover:bg-white/10 ${
+              embedded ? "" : "md:hidden"
+            }`}
             onClick={newChat}
             type="button"
           >

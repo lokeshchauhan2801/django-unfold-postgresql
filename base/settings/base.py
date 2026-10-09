@@ -69,6 +69,7 @@ TEMPLATES = [
                 "django.template.context_processors.csrf",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "chat.context_processors.admin_chat_history",
             ],
         },
     },
@@ -131,6 +132,11 @@ UNFOLD = {
                         "link": reverse_lazy("admin:index"),
                     },
                     {
+                        "title": "New chat",
+                        "icon": "add_comment",
+                        "link": reverse_lazy("admin:chat_conversation_new"),
+                    },
+                    {
                         "title": "Chat",
                         "icon": "chat",
                         "link": reverse_lazy("admin:chat_conversation_sessions"),
@@ -190,22 +196,6 @@ UNFOLD = {
                 "title": "Agentic",
                 "collapsible": True,
                 "items": [],
-            },
-            {
-                "title": "Chat",
-                "collapsible": True,
-                "items": [
-                    {
-                        "title": "Conversation sessions",
-                        "icon": "forum",
-                        "link": reverse_lazy("admin:chat_conversation_changelist"),
-                    },
-                    {
-                        "title": "Conversations",
-                        "icon": "chat_bubble",
-                        "link": reverse_lazy("admin:chat_message_changelist"),
-                    },
-                ],
             },
         ],
     },
