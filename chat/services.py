@@ -98,12 +98,16 @@ class ChatService:
         )
 
     def _find_relevant_chunks(self, user, question, conversation=None, company=None):
-        attached_document_ids = (
-            list(conversation.documents.values_list("pk", flat=True))
-            if conversation
-            else []
-        )
+        """Retrieve grounding passages, company library documents first.
+
+        Only *library* documents (uploaded from the Documents section) are
+        chunked and embedded, so vector retrieval always targets them. Chat
+        attachments are chat data only and are never embedded; questions about
+        a chat-attached CSV are answered from the file directly (see the chart
+        builder), not from the vector store.
+        """
         documents = Document.objects.filter(
+            source=Document.SOURCE_LIBRARY,
             status=Document.STATUS_READY,
             chunk_count__gt=0,
         )
@@ -111,8 +115,6 @@ class ChatService:
             documents = documents.filter(company=company)
         else:
             documents = documents.filter(uploaded_by=user, company__isnull=True)
-        if attached_document_ids:
-            documents = documents.filter(pk__in=attached_document_ids)
         document_ids = [str(document_id) for document_id in documents.values_list("pk", flat=True)]
         if not document_ids:
             return []
@@ -460,6 +462,40 @@ class ChatService:
             return None
         return index, labels, is_numeric
 
+    def _cached_answer(self, conversation, question, exclude_user_message=None):
+        """Return a prior assistant answer for an identical question in this
+        conversation, or ``None``.
+
+        Repeated queries are served from the database so the LLM is not called
+        again. Matching is per-conversation and exact (case-insensitive, trimmed)
+        to avoid surfacing another conversation's or user's answer. The cached
+        answer reuses the stored content, citations, and chart_data.
+        """
+        if conversation is None:
+            return None
+        normalized = question.strip()
+        if not normalized:
+            return None
+
+        user_turns = conversation.messages.filter(
+            role=Message.ROLE_USER,
+            content__iexact=normalized,
+        )
+        if exclude_user_message is not None:
+            user_turns = user_turns.exclude(pk=exclude_user_message.pk)
+        for user_turn in user_turns.order_by("created_at"):
+            assistant = (
+                conversation.messages.filter(
+                    role=Message.ROLE_ASSISTANT,
+                    created_at__gt=user_turn.created_at,
+                )
+                .order_by("created_at")
+                .first()
+            )
+            if assistant is not None:
+                return assistant
+        return None
+
     def process_message(
         self,
         user,
@@ -476,6 +512,30 @@ class ChatService:
             or conversation.company_id != getattr(company, "pk", None)
         ):
             raise ValueError("Conversation does not belong to the signed-in user.")
+
+        # Repeated-query cache: if this exact question already has an answer in
+        # this conversation, serve it from the database without calling the LLM.
+        cached = self._cached_answer(
+            conversation, message_text, exclude_user_message=user_message
+        )
+        if cached is not None:
+            with transaction.atomic():
+                if not user_message:
+                    self.add_message(
+                        conversation,
+                        Message.ROLE_USER,
+                        message_text,
+                        model_name="user",
+                    )
+                assistant_message = self.add_message(
+                    conversation,
+                    Message.ROLE_ASSISTANT,
+                    cached.content,
+                    citations=cached.citations,
+                    chart_data=cached.chart_data,
+                )
+                conversation.save(update_fields=["updated_at"])
+            return assistant_message
 
         history_query = (
             conversation.messages.exclude(role=Message.ROLE_SYSTEM)

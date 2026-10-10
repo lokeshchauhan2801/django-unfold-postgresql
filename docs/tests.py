@@ -163,7 +163,7 @@ class PdfToChatFlowTests(TestCase):
             or "Records are retained for seven years before secure disposal."
         )
         return self.client.post(
-            reverse("document_upload"),
+            reverse("document_library_upload"),
             {
                 "file": SimpleUploadedFile(
                     name,
@@ -179,14 +179,10 @@ class PdfToChatFlowTests(TestCase):
         payload = upload_response.json()["document"]
         document = Document.objects.get(pk=payload["id"])
         self.assertEqual(document.status, Document.STATUS_QUEUED)
+        self.assertEqual(document.source, Document.SOURCE_LIBRARY)
         process_document_task(str(document.pk))
         document.refresh_from_db()
         chunk = DocumentChunk.objects.get(document=document)
-        conversation = Conversation.objects.get(
-            pk=upload_response.json()["conversation_id"],
-            user=self.user,
-        )
-        attachment_message = conversation.messages.get()
 
         self.assertEqual(document.status, Document.STATUS_READY)
         self.assertEqual(document.processing_stage, "ready")
@@ -194,27 +190,8 @@ class PdfToChatFlowTests(TestCase):
         self.assertEqual(document.chunk_count, 1)
         self.assertIn("seven years", chunk.content)
         self.assertEqual(payload["reference_id"], str(document.pk))
-        self.assertEqual(document.conversation, conversation)
-        self.assertEqual(list(attachment_message.documents.all()), [document])
-        self.assertEqual(
-            attachment_message.content,
-            "Attached file: records-policy.pdf",
-        )
-
-        history_response = self.client.get(
-            reverse(
-                "conversation_detail",
-                kwargs={"conversation_id": conversation.pk},
-            )
-        )
-        self.assertEqual(history_response.status_code, 200)
-        self.assertEqual(
-            history_response.json()["messages"][0]["documents"][0]["reference_id"],
-            str(document.pk),
-        )
-        self.assertTrue(
-            history_response.json()["messages"][0]["documents"][0]["file_url"]
-        )
+        # Library documents are the company knowledge base, not tied to a chat.
+        self.assertIsNone(document.conversation)
 
         stored_vectors = ChromaVectorStore().similarity_search(
             [1.0, 0.0, 1.0],
@@ -229,24 +206,25 @@ class PdfToChatFlowTests(TestCase):
         )
         self.assertEqual(stored_embeddings[str(chunk.pk)], [1.0, 0.0, 1.0])
 
+        # A chat question is answered using the embedded library document.
         chat_response = self.client.post(
             reverse("chat_api"),
-            {
-                "message": "How long are records retained?",
-                "conversation_id": str(conversation.pk),
-            },
+            {"message": "How long are records retained?"},
             content_type="application/json",
         )
         self.assertEqual(chat_response.status_code, 200, chat_response.content)
         result = chat_response.json()
-        self.assertEqual(result["conversation_id"], str(conversation.pk))
-        self.assertEqual(Conversation.objects.count(), 1)
-        self.assertEqual(conversation.messages.count(), 3)
+        conversation = Conversation.objects.get(pk=result["conversation_id"])
         self.assertIn(str(chunk.pk), self.provider.prompts[-1])
         self.assertEqual(result["citations"][0]["reference_id"], str(chunk.pk))
         self.assertEqual(result["citations"][0]["document_id"], str(document.pk))
         self.assertEqual(result["citations"][0]["page"], 1)
-        self.assertEqual(Message.objects.get(role=Message.ROLE_ASSISTANT).citations, result["citations"])
+        self.assertEqual(
+            Message.objects.filter(role=Message.ROLE_ASSISTANT).latest(
+                "created_at"
+            ).citations,
+            result["citations"],
+        )
         file_response = self.client.get(
             reverse(
                 "document_file",
@@ -254,6 +232,7 @@ class PdfToChatFlowTests(TestCase):
             )
         )
         self.assertEqual(file_response.status_code, 200)
+        self.assertTrue(conversation)
 
     def test_uploaded_files_are_assigned_to_the_active_company(self):
         company = Company.objects.create(name="Acme", slug="acme")
@@ -267,9 +246,8 @@ class PdfToChatFlowTests(TestCase):
 
         self.assertEqual(response.status_code, 202, response.content)
         document = Document.objects.get(pk=response.json()["document"]["id"])
-        conversation = Conversation.objects.get(pk=response.json()["conversation_id"])
         self.assertEqual(document.company, company)
-        self.assertEqual(conversation.company, company)
+        self.assertEqual(document.source, Document.SOURCE_LIBRARY)
 
     def test_upload_saves_the_question_as_the_attachment_message(self):
         question = "Explain this CSV and create charts"
@@ -285,7 +263,7 @@ class PdfToChatFlowTests(TestCase):
             },
         )
 
-        self.assertEqual(response.status_code, 202, response.content)
+        self.assertEqual(response.status_code, 201, response.content)
         message = Message.objects.get(
             conversation_id=response.json()["conversation_id"],
         )
@@ -295,6 +273,11 @@ class PdfToChatFlowTests(TestCase):
             [document.title for document in message.documents.all()],
             ["education.csv"],
         )
+        # Chat attachments are chat data only: ready immediately, not embedded.
+        attached = Document.objects.get(title="education.csv")
+        self.assertEqual(attached.source, Document.SOURCE_CHAT)
+        self.assertEqual(attached.status, Document.STATUS_READY)
+        self.assertEqual(attached.chunk_count, 0)
 
     def test_rejects_non_pdf_and_invalid_pdf_content(self):
         not_pdf = self.client.post(
@@ -310,7 +293,7 @@ class PdfToChatFlowTests(TestCase):
         self.assertEqual(not_pdf.status_code, 400)
 
         unreadable_pdf = self.client.post(
-            reverse("document_upload"),
+            reverse("document_library_upload"),
             {
                 "file": SimpleUploadedFile(
                     "broken.pdf",
@@ -369,7 +352,7 @@ class PdfToChatFlowTests(TestCase):
         for name, content, content_type, expected_text in uploads:
             with self.subTest(name=name):
                 response = self.client.post(
-                    reverse("document_upload"),
+                    reverse("document_library_upload"),
                     {
                         "file": SimpleUploadedFile(name, content, content_type=content_type)
                     },
@@ -450,7 +433,7 @@ class PdfToChatFlowTests(TestCase):
         self.assertIn("Supported files", unsupported.json()["error"])
 
         invalid_json = self.client.post(
-            reverse("document_upload"),
+            reverse("document_library_upload"),
             {
                 "file": SimpleUploadedFile(
                     "broken.json",
@@ -484,6 +467,7 @@ class PdfToChatFlowTests(TestCase):
             file_size=48,
             status=Document.STATUS_FAILED,
             processing_error="The previous chunk limit was reached.",
+            source=Document.SOURCE_LIBRARY,
         )
 
         response = self.client.post(
@@ -510,6 +494,7 @@ class PdfToChatFlowTests(TestCase):
             ),
             file_type="txt",
             status=Document.STATUS_QUEUED,
+            source=Document.SOURCE_LIBRARY,
         )
 
         response = self.client.post(
@@ -601,7 +586,7 @@ class PdfToChatFlowTests(TestCase):
         self.assertEqual(response.status_code, 503)
         document = Document.objects.get(pk=response.json()["document"]["id"])
         self.assertEqual(document.status, Document.STATUS_FAILED)
-        self.assertIn("Redis and a Celery worker", document.processing_error)
+        self.assertIn("Celery/Redis, Kafka, or Temporal", document.processing_error)
 
     @override_settings(DEBUG=True)
     @patch("docs.tasks.process_document_task.apply_async")

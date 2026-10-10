@@ -18,6 +18,18 @@ class Document(models.Model):
         (STATUS_FAILED, "Failed"),
     ]
 
+    # Where the file came from, which decides whether it is embedded.
+    #   chat    — attached inside a chat session; stored as chat data only,
+    #             never chunked or embedded into the vector store.
+    #   library — uploaded from the Documents section; chunked + embedded and
+    #             searched first during retrieval.
+    SOURCE_CHAT = "chat"
+    SOURCE_LIBRARY = "library"
+    SOURCE_CHOICES = [
+        (SOURCE_CHAT, "Chat attachment"),
+        (SOURCE_LIBRARY, "Document library"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="documents")
@@ -35,6 +47,12 @@ class Document(models.Model):
         null=True,
         blank=True,
         related_name="documents",
+    )
+    source = models.CharField(
+        max_length=20,
+        choices=SOURCE_CHOICES,
+        default=SOURCE_CHAT,
+        db_index=True,
     )
     title = models.CharField(max_length=255)
     file = models.FileField(upload_to="documents/%Y/%m/%d/")

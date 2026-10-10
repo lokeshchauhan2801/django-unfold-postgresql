@@ -187,7 +187,7 @@ Open:
 
 The chat and admin routes share the same sign-in screen and accept either a username or email address. The same Django session is used on both routes. Active company owners and admins can access the admin workspace for their own company; system administrators can access every company.
 
-The main site opens a React-powered ChatGPT-style workspace. Start a chat from the sidebar, browse saved conversations, and use the plus button inside the prompt composer to attach PDF, DOCX, TXT, Markdown, CSV, XLSX, or JSON files. Chats and messages are stored in Django and scoped to the selected company; users with multiple memberships choose a company workspace before chatting. Uploaded files retain their owner, company, conversation, file metadata, processing status, chunk count, and database reference; each attachment appears in its conversation history and the Library. Supported files are extracted, split into overlapping chunks, embedded with OpenAI, and stored in persistent Chroma. In the admin workspace, the Chat sessions view shows sessions on the left and the selected conversation with its indexed chunk text on the right. System administrators can also load stored embedding vectors for individual chunks. Each chunk UUID and source location is stored in Django and returned as a citation. Chat responses use the configured AI provider. When a chart is requested, the chat API returns validated pie, bar, or line chart data grounded in retrieved file passages; the React client renders that API response. Scanned/image-only PDFs, legacy XLS files, and other unsupported formats are rejected.
+The main site opens a React-powered dashboard workspace with a sidebar for Dashboard, Chats, Documents, and Members, a company switcher, and a header showing the active company's name and logo. Start a chat from the sidebar, browse saved conversations, and use the plus button inside the prompt composer to attach PDF, DOCX, TXT, Markdown, CSV, XLSX, or JSON files. Chats and messages are stored in Django and scoped to the selected company; users with multiple memberships choose a company workspace before chatting. Files attached inside a chat are stored as *chat data only* — linked to the conversation, saved immediately as ready, and never chunked or embedded. Company knowledge-base files are uploaded separately from the **Documents** section; those library documents are extracted, split into overlapping chunks, embedded with OpenAI, and stored in persistent Chroma. Retrieval searches the company's library documents first, while a chat-attached CSV is read directly to build charts. Repeated questions in a conversation are served from the database without calling the LLM. In the admin workspace, the Chat sessions view shows sessions on the left and the selected conversation with its indexed chunk text on the right. System administrators can also load stored embedding vectors for individual chunks. Each chunk UUID and source location is stored in Django and returned as a citation. Chat responses use the configured AI provider. When a chart is requested, the chat API returns validated pie, bar, or line chart data grounded in retrieved file passages; the React client renders that API response and the chart data is persisted on the message. Scanned/image-only PDFs, legacy XLS files, and other unsupported formats are rejected.
 
 Set `OPENAI_API_KEY` for document embeddings. By default, chat uses OpenAI with `AI_PROVIDER=openai` and `DEFAULT_LLM_MODEL=gpt-4o-mini`. To use DeepSeek or another OpenAI-compatible chat API, set `AI_PROVIDER=openai_compatible`, `AI_BASE_URL` to that API's `/v1` endpoint, `AI_API_KEY` to its key, and `DEFAULT_LLM_MODEL` to its model identifier. Chat credentials are separate from the OpenAI embedding key; switching chat providers does not require code changes. Extracted text from supported files and chat prompts are sent to the configured provider for answers. Local development stores Chroma data under `chroma_data/`. The admin remains available at `/admin/`.
 
@@ -255,9 +255,53 @@ Copy `.env.example` to `.env` and override as needed.
 
 | Method | URL                   | Description              |
 |--------|-----------------------|--------------------------|
-| GET    | `/documents/`         | List uploaded documents and their processing metadata |
-| POST   | `/documents/upload/`  | Upload and index a supported document, linked to a conversation |
-| POST   | `/documents/<id>/reprocess/` | Retry indexing a previously saved failed upload |
+| GET    | `/documents/`         | List the active company's documents (chat attachments and library documents) with processing metadata |
+| POST   | `/documents/upload/`  | Attach a file to a chat session (chat data only — never chunked or embedded) |
+| POST   | `/documents/library/upload/` | Upload a company **library** document; it is chunked and embedded into the vector store. Optional `backend=celery\|kafka\|temporal` |
+| POST   | `/documents/<id>/process/` | Process a library document with a chosen backend (`backend=celery\|kafka\|temporal`). Backs the library "Actions" dropdown |
+| POST   | `/documents/<id>/reprocess/` | Retry indexing a failed/unqueued library document (optional `backend=`) |
+
+**Chat attachments vs. company library documents**
+
+The platform keeps two kinds of files cleanly separated:
+
+- **Chat attachments** (`source=chat`) — files added inside a chat session via
+  the composer. They are stored as *chat data only*: linked to the conversation
+  and message history, saved immediately as `ready`, and **never chunked or
+  embedded** into the vector store. The chat can still read the raw file
+  directly (for example to build a CSV distribution chart) and ask questions
+  grounded in the company's library documents.
+- **Library documents** (`source=library`) — files uploaded from the Documents
+  section. These form the company knowledge base: they are chunked and embedded
+  into Chroma and are what retrieval searches. They are not tied to a
+  conversation.
+
+**Retrieval order.** When answering a question the service searches the active
+company's **library documents first** (company-scoped vector search). Chat
+attachments are not embedded, so questions about a chat-attached CSV are
+answered from the file directly (chart building) rather than from the index.
+
+**Repeated-query cache.** Identical questions are served from the database
+without calling the LLM. Matching is per-conversation and exact
+(case-insensitive, trimmed), so a repeated question returns the previously
+stored assistant answer — including its citations and any persisted chart —
+with no additional model call. This keeps repeated asks fast and deterministic
+and preserves saved charts even if the provider would no longer produce one.
+
+**Processing backends.** Library documents are chunked and embedded through a
+selectable backend. The Documents library exposes an **Actions** dropdown per
+file — *Process with Kafka*, *Process with Celery*, and *Process with
+Temporal* — which calls `/documents/<id>/process/` with the chosen `backend`.
+The backend is dispatched accordingly:
+
+| Backend    | Dispatch |
+|------------|----------|
+| `celery`   | Celery task via Redis (or the managed local background executor in `DEBUG`) |
+| `kafka`    | Publishes a `document.processing.requested` event via the Kafka producer |
+| `temporal` | Starts a `DocumentProcessingWorkflow` on the Temporal task queue |
+
+The default backend is controlled by `DOCUMENT_PROCESSING_BACKEND`; the Actions
+dropdown overrides it per document.
 
 ### Users / Auth
 

@@ -737,6 +737,7 @@ class ChatbotApiTests(TestCase):
             file="documents/retention.pdf",
             status=Document.STATUS_READY,
             chunk_count=1,
+            source=Document.SOURCE_LIBRARY,
         )
         chunk = DocumentChunk.objects.create(
             document=document,
@@ -1163,3 +1164,451 @@ class CompanyChatAdminTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["embedding"], [0.25, 0.75])
+
+
+class TenantIsolationAndRoleTests(TestCase):
+    """End-to-end tenant-isolation and role-based access coverage.
+
+    Two companies (Acme, Globex) each with an admin and a member, plus a
+    cross-company member and a system superuser. Every assertion verifies the
+    backend scoping rules in company.access — not just the frontend.
+    """
+
+    def setUp(self):
+        User = get_user_model()
+        self.acme = Company.objects.create(name="Acme", slug="acme")
+        self.globex = Company.objects.create(name="Globex", slug="globex")
+
+        self.acme_admin = User.objects.create_user(
+            username="acme-admin", email="acme-admin@example.com", password="pw-acme-admin"
+        )
+        self.acme_member = User.objects.create_user(
+            username="acme-member", email="acme-member@example.com", password="pw-acme-member"
+        )
+        self.globex_admin = User.objects.create_user(
+            username="globex-admin", email="globex-admin@example.com", password="pw-globex-admin"
+        )
+        self.superuser = User.objects.create_superuser(
+            username="root", email="root@example.com", password="pw-root"
+        )
+
+        CompanyMembership.objects.create(
+            user=self.acme_admin, company=self.acme, role=CompanyMembership.Role.ADMIN
+        )
+        CompanyMembership.objects.create(
+            user=self.acme_member, company=self.acme, role=CompanyMembership.Role.MEMBER
+        )
+        CompanyMembership.objects.create(
+            user=self.globex_admin, company=self.globex, role=CompanyMembership.Role.OWNER
+        )
+
+        # Seed conversations + documents for each company.
+        self.acme_member_convo = Conversation.objects.create(
+            user=self.acme_member, company=self.acme, title="Acme member chat"
+        )
+        self.acme_admin_convo = Conversation.objects.create(
+            user=self.acme_admin, company=self.acme, title="Acme admin chat"
+        )
+        self.globex_convo = Conversation.objects.create(
+            user=self.globex_admin, company=self.globex, title="Globex chat"
+        )
+
+        self.acme_member_doc = Document.objects.create(
+            uploaded_by=self.acme_member,
+            company=self.acme,
+            conversation=self.acme_member_convo,
+            title="acme-member.txt",
+            file="documents/acme-member.txt",
+            file_type="txt",
+            status=Document.STATUS_READY,
+        )
+        self.globex_doc = Document.objects.create(
+            uploaded_by=self.globex_admin,
+            company=self.globex,
+            conversation=self.globex_convo,
+            title="globex.txt",
+            file="documents/globex.txt",
+            file_type="txt",
+            status=Document.STATUS_READY,
+        )
+
+    def _login(self, user):
+        self.client.force_login(user)
+
+    # ---- Company admin sees ALL company conversations ------------------- #
+    def test_company_admin_sees_all_company_conversations(self):
+        self._login(self.acme_admin)
+        response = self.client.get(reverse("conversation_list"))
+        self.assertEqual(response.status_code, 200)
+        ids = {item["id"] for item in response.json()["conversations"]}
+        self.assertEqual(
+            ids, {str(self.acme_member_convo.pk), str(self.acme_admin_convo.pk)}
+        )
+
+    # ---- Regular member sees only their OWN conversations --------------- #
+    def test_member_sees_only_their_own_conversations(self):
+        self._login(self.acme_member)
+        response = self.client.get(reverse("conversation_list"))
+        self.assertEqual(response.status_code, 200)
+        ids = {item["id"] for item in response.json()["conversations"]}
+        self.assertEqual(ids, {str(self.acme_member_convo.pk)})
+
+    # ---- Company admin cannot reach another company's conversation ------ #
+    def test_admin_cannot_open_other_company_conversation_by_id(self):
+        self._login(self.acme_admin)
+        response = self.client.get(
+            reverse("conversation_detail", kwargs={"conversation_id": self.globex_convo.pk})
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_member_cannot_open_other_members_conversation(self):
+        self._login(self.acme_member)
+        response = self.client.get(
+            reverse("conversation_detail", kwargs={"conversation_id": self.acme_admin_convo.pk})
+        )
+        self.assertEqual(response.status_code, 404)
+
+    # ---- Documents: admin sees all, member only own, no cross-tenant ---- #
+    def test_company_admin_sees_all_company_documents(self):
+        self._login(self.acme_admin)
+        response = self.client.get(reverse("document_list"))
+        self.assertEqual(response.status_code, 200)
+        titles = {item["title"] for item in response.json()["documents"]}
+        self.assertEqual(titles, {"acme-member.txt"})
+        self.assertNotIn("globex.txt", titles)
+
+    def test_document_file_blocks_cross_tenant_direct_link(self):
+        self._login(self.acme_admin)
+        response = self.client.get(
+            reverse("document_file", kwargs={"file_path": self.globex_doc.file.name})
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_member_cannot_download_other_company_file(self):
+        self._login(self.acme_member)
+        response = self.client.get(
+            reverse("document_file", kwargs={"file_path": self.globex_doc.file.name})
+        )
+        self.assertEqual(response.status_code, 404)
+
+    # ---- Members endpoint: admin only, scoped ------------------------- #
+    def test_members_endpoint_lists_only_own_company_for_admin(self):
+        self._login(self.acme_admin)
+        response = self.client.get(reverse("company_members"))
+        self.assertEqual(response.status_code, 200)
+        emails = {m["email"] for m in response.json()["members"]}
+        self.assertEqual(emails, {"acme-admin@example.com", "acme-member@example.com"})
+        self.assertNotIn("globex-admin@example.com", emails)
+
+    def test_members_endpoint_forbidden_for_regular_member(self):
+        self._login(self.acme_member)
+        response = self.client.get(reverse("company_members"))
+        self.assertEqual(response.status_code, 403)
+
+    # ---- Dashboard scoping -------------------------------------------- #
+    def test_dashboard_counts_are_company_scoped_for_admin(self):
+        self._login(self.acme_admin)
+        response = self.client.get(reverse("company_dashboard"))
+        self.assertEqual(response.status_code, 200)
+        stats = response.json()["stats"]
+        self.assertEqual(stats["conversation_count"], 2)
+        self.assertEqual(stats["document_count"], 1)
+        self.assertEqual(stats["member_count"], 2)
+
+    def test_dashboard_counts_are_scoped_to_self_for_member(self):
+        self._login(self.acme_member)
+        response = self.client.get(reverse("company_dashboard"))
+        self.assertEqual(response.status_code, 200)
+        stats = response.json()["stats"]
+        self.assertEqual(stats["conversation_count"], 1)
+        self.assertNotIn("member_count", stats)
+
+    # ---- System admin (superuser) can switch into any company --------- #
+    def test_superuser_can_select_and_view_any_company(self):
+        self._login(self.superuser)
+        selected = self.client.post(
+            reverse("chat_set_active_company"), {"company_id": str(self.globex.pk)}
+        )
+        self.assertEqual(selected.status_code, 200)
+        self.assertEqual(selected.json()["role"], "system_admin")
+
+        response = self.client.get(reverse("conversation_list"))
+        ids = {item["id"] for item in response.json()["conversations"]}
+        self.assertEqual(ids, {str(self.globex_convo.pk)})
+
+    def test_superuser_switching_companies_updates_scope(self):
+        self._login(self.superuser)
+        self.client.post(
+            reverse("chat_set_active_company"), {"company_id": str(self.acme.pk)}
+        )
+        acme_ids = {
+            item["id"]
+            for item in self.client.get(reverse("conversation_list")).json()["conversations"]
+        }
+        self.assertEqual(
+            acme_ids, {str(self.acme_member_convo.pk), str(self.acme_admin_convo.pk)}
+        )
+
+        self.client.post(
+            reverse("chat_set_active_company"), {"company_id": str(self.globex.pk)}
+        )
+        globex_ids = {
+            item["id"]
+            for item in self.client.get(reverse("conversation_list")).json()["conversations"]
+        }
+        self.assertEqual(globex_ids, {str(self.globex_convo.pk)})
+
+    # ---- Non-member cannot select a company they don't belong to ------- #
+    def test_user_cannot_select_company_without_membership(self):
+        self._login(self.acme_admin)
+        response = self.client.post(
+            reverse("chat_set_active_company"), {"company_id": str(self.globex.pk)}
+        )
+        self.assertEqual(response.status_code, 403)
+
+    # ---- set_active_company returns metadata + role + permissions ------ #
+    def test_set_active_company_returns_metadata_role_and_permissions(self):
+        self._login(self.acme_admin)
+        response = self.client.post(
+            reverse("chat_set_active_company"), {"company_id": str(self.acme.pk)}
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["company"]["name"], "Acme")
+        self.assertEqual(payload["role"], "company_admin")
+        self.assertTrue(payload["permissions"]["is_company_admin"])
+        self.assertTrue(payload["permissions"]["can_view_members"])
+
+    def test_member_permissions_do_not_grant_admin_views(self):
+        self._login(self.acme_member)
+        response = self.client.post(
+            reverse("chat_set_active_company"), {"company_id": str(self.acme.pk)}
+        )
+        # acme_member only belongs to one company so selection is a no-op gate,
+        # but the endpoint still returns the correct role/permissions.
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["role"], "member")
+        self.assertFalse(payload["permissions"]["is_company_admin"])
+        self.assertFalse(payload["permissions"]["can_view_members"])
+
+
+class ChatVsLibraryFileTests(TestCase):
+    """Chat attachments vs. company library documents, retrieval order, and the
+    repeated-query cache that serves identical questions from the database.
+    """
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="split-user",
+            email="split-user@example.com",
+            password="secret123",
+        )
+        self.client = Client(HTTP_HOST="localhost")
+        self.client.force_login(self.user)
+
+    # ---- Chat attachments are stored as chat data only (no embedding) --- #
+    def test_chat_attachment_is_not_chunked_or_embedded(self):
+        with patch("docs.views.dispatch_document_processing") as dispatch:
+            response = self.client.post(
+                reverse("document_upload"),
+                {
+                    "file": SimpleUploadedFile(
+                        "notes.csv",
+                        b"name,age\nAda,30\nBob,41\n",
+                        content_type="text/csv",
+                    ),
+                    "message": "Here is a file",
+                },
+            )
+        self.assertEqual(response.status_code, 201, response.content)
+        dispatch.assert_not_called()
+        document = Document.objects.get(pk=response.json()["document"]["id"])
+        self.assertEqual(document.source, Document.SOURCE_CHAT)
+        self.assertEqual(document.status, Document.STATUS_READY)
+        self.assertEqual(document.chunk_count, 0)
+        self.assertEqual(DocumentChunk.objects.filter(document=document).count(), 0)
+        self.assertIsNotNone(document.conversation)
+
+    # ---- Library uploads are chunked + embedded ------------------------- #
+    def test_library_upload_is_queued_for_embedding(self):
+        with patch(
+            "docs.views.dispatch_document_processing",
+            return_value=("task-1", "celery"),
+        ) as dispatch:
+            response = self.client.post(
+                reverse("document_library_upload"),
+                {
+                    "file": SimpleUploadedFile(
+                        "kb.txt",
+                        b"Company knowledge base content.",
+                        content_type="text/plain",
+                    )
+                },
+            )
+        self.assertEqual(response.status_code, 202, response.content)
+        dispatch.assert_called_once()
+        document = Document.objects.get(pk=response.json()["document"]["id"])
+        self.assertEqual(document.source, Document.SOURCE_LIBRARY)
+        self.assertEqual(document.status, Document.STATUS_QUEUED)
+        self.assertIsNone(document.conversation)
+
+    # ---- Retrieval only searches library documents --------------------- #
+    def test_retrieval_targets_only_library_documents(self):
+        library_doc = Document.objects.create(
+            uploaded_by=self.user,
+            title="policy.pdf",
+            file="documents/policy.pdf",
+            status=Document.STATUS_READY,
+            chunk_count=1,
+            source=Document.SOURCE_LIBRARY,
+        )
+        library_chunk = DocumentChunk.objects.create(
+            document=library_doc,
+            chunk_index=0,
+            page_number=1,
+            content="Retention is seven years.",
+            source_location="Page 1",
+        )
+        # A chat-attached document with (hypothetical) chunks must be ignored.
+        chat_doc = Document.objects.create(
+            uploaded_by=self.user,
+            title="chat.pdf",
+            file="documents/chat.pdf",
+            status=Document.STATUS_READY,
+            chunk_count=1,
+            source=Document.SOURCE_CHAT,
+        )
+        DocumentChunk.objects.create(
+            document=chat_doc,
+            chunk_index=0,
+            page_number=1,
+            content="Chat-only content.",
+            source_location="Page 1",
+        )
+        conversation = Conversation.objects.create(user=self.user, title="Ask")
+        conversation.documents.add(chat_doc)
+
+        provider = TestAIProvider()
+        vector_store = TestVectorStore(library_chunk)
+        service = ChatService(provider=provider, vector_store=vector_store)
+        chunks = service._find_relevant_chunks(self.user, "retention?", conversation, None)
+
+        self.assertEqual([c.pk for c in chunks], [library_chunk.pk])
+        self.assertEqual(
+            vector_store.last_filter["$and"][1],
+            {"document_id": {"$in": [str(library_doc.pk)]}},
+        )
+
+    # ---- Repeated query is served from the DB without calling the LLM --- #
+    def test_repeated_query_is_served_from_database(self):
+        provider = TestAIProvider()
+        service = ChatService(provider=provider, vector_store=_EmptyVectorStore())
+        conversation = Conversation.objects.create(user=self.user, title="Repeat")
+
+        first = service.process_message(self.user, "What is the policy?", conversation)
+        self.assertEqual(provider.last_prompt.count("User: What is the policy?"), 1)
+        prompt_after_first = provider.last_prompt
+
+        second = service.process_message(self.user, "What is the policy?", conversation)
+        # The LLM must not be called again: the prompt is unchanged and the
+        # cached answer content/citations are reused from the first turn.
+        self.assertEqual(provider.last_prompt, prompt_after_first)
+        self.assertEqual(second.content, first.content)
+        self.assertEqual(second.citations, first.citations)
+        # Four messages total: user/assistant twice.
+        self.assertEqual(conversation.messages.count(), 4)
+
+    def test_repeated_query_reuses_persisted_chart_data(self):
+        provider = TestAIProvider()
+        provider.chart = {
+            "type": "pie",
+            "title": "Share",
+            "x_axis": "Category",
+            "y_axis": "Count",
+            "series": ["Count"],
+            "data": [{"label": "A", "values": [3.0]}, {"label": "B", "values": [1.0]}],
+        }
+        service = ChatService(provider=provider, vector_store=_EmptyVectorStore())
+        conversation = Conversation.objects.create(user=self.user, title="Chart")
+
+        first = service.process_message(self.user, "Show a pie chart", conversation)
+        self.assertIsNotNone(first.chart_data)
+        provider.chart = None  # a second LLM call would now return no chart
+
+        second = service.process_message(self.user, "Show a pie chart", conversation)
+        # Served from the DB, so the chart persists even though the provider
+        # would no longer produce one.
+        self.assertEqual(second.chart_data, first.chart_data)
+
+
+class DocumentProcessingBackendTests(TestCase):
+    """The per-document process endpoint dispatches to the chosen backend."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="proc-user",
+            email="proc-user@example.com",
+            password="secret123",
+        )
+        self.client = Client(HTTP_HOST="localhost")
+        self.client.force_login(self.user)
+        self.document = Document.objects.create(
+            uploaded_by=self.user,
+            title="kb.txt",
+            file="documents/kb.txt",
+            file_type="txt",
+            status=Document.STATUS_READY,
+            source=Document.SOURCE_LIBRARY,
+            chunk_count=2,
+        )
+
+    def test_process_with_kafka_dispatches_kafka_backend(self):
+        with patch(
+            "docs.views.dispatch_document_processing",
+            return_value=("job-kafka", "kafka"),
+        ) as dispatch:
+            response = self.client.post(
+                reverse("document_process", kwargs={"document_id": self.document.pk}),
+                {"backend": "kafka"},
+            )
+        self.assertEqual(response.status_code, 202, response.content)
+        dispatch.assert_called_once_with(str(self.document.pk), backend="kafka")
+        self.document.refresh_from_db()
+        self.assertEqual(self.document.processing_backend, "kafka")
+
+    def test_process_with_temporal_dispatches_temporal_backend(self):
+        with patch(
+            "docs.views.dispatch_document_processing",
+            return_value=("job-temporal", "temporal"),
+        ) as dispatch:
+            response = self.client.post(
+                reverse("document_process", kwargs={"document_id": self.document.pk}),
+                {"backend": "temporal"},
+            )
+        self.assertEqual(response.status_code, 202, response.content)
+        dispatch.assert_called_once_with(str(self.document.pk), backend="temporal")
+        self.document.refresh_from_db()
+        self.assertEqual(self.document.processing_backend, "temporal")
+
+    def test_process_rejects_unknown_backend(self):
+        response = self.client.post(
+            reverse("document_process", kwargs={"document_id": self.document.pk}),
+            {"backend": "sqs"},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_process_rejects_chat_attachment(self):
+        chat_doc = Document.objects.create(
+            uploaded_by=self.user,
+            title="chat.txt",
+            file="documents/chat.txt",
+            file_type="txt",
+            status=Document.STATUS_READY,
+            source=Document.SOURCE_CHAT,
+        )
+        response = self.client.post(
+            reverse("document_process", kwargs={"document_id": chat_doc.pk}),
+            {"backend": "celery"},
+        )
+        self.assertEqual(response.status_code, 409)

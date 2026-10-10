@@ -20,6 +20,11 @@ class ProcessingDispatcher:
         backend = _load_backend(backend_name)
         return cls(backend)
 
+    @classmethod
+    def from_name(cls, name: str) -> 'ProcessingDispatcher':
+        """Create dispatcher for an explicitly named backend (celery/kafka/temporal)."""
+        return cls(_load_backend(name.lower()))
+
     def dispatch(self, request: ProcessingRequest) -> str:
         logger.info('Dispatching document %s via %s', request.document_id, type(self._backend).__name__)
         return self._backend.dispatch(request)

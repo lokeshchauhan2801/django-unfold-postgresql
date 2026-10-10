@@ -41,9 +41,22 @@ def process_document_task(
     return {"status": Document.STATUS_READY, "document_id": document_id}
 
 
-def dispatch_document_processing(document_id: str) -> tuple[str, str]:
-    """Use the local background executor in development and Celery elsewhere."""
-    if settings.DEBUG:
+def dispatch_document_processing(
+    document_id: str, backend: str | None = None
+) -> tuple[str, str]:
+    """Dispatch chunk+embed processing for a document.
+
+    ``backend`` selects the strategy (``celery``/``kafka``/``temporal``). When
+    omitted, the configured ``DOCUMENT_PROCESSING_BACKEND`` is used.
+
+    For the Celery/default path in local development (``DEBUG``) we run the work
+    inline on a managed background executor so Redis and a Celery worker are not
+    required. Kafka and Temporal always dispatch through the
+    ``ProcessingDispatcher`` strategy so the selected backend handles the job.
+    """
+    requested = (backend or getattr(settings, "DOCUMENT_PROCESSING_BACKEND", "celery")).lower()
+
+    if requested in {"celery", "local-background"} and settings.DEBUG:
         task_id = str(uuid4())
         _local_executor.submit(
             process_document_task.run,
@@ -52,5 +65,23 @@ def dispatch_document_processing(document_id: str) -> tuple[str, str]:
         )
         return task_id, "local-background"
 
-    task = process_document_task.apply_async(args=[document_id], retry=False)
-    return task.id, "celery"
+    if requested == "celery":
+        task = process_document_task.apply_async(args=[document_id], retry=False)
+        return task.id, "celery"
+
+    # Kafka / Temporal (and any non-default backend) go through the strategy
+    # dispatcher so the selected infrastructure handles the document.
+    from infrastructure.processing.dispatcher import ProcessingDispatcher
+    from infrastructure.processing.interfaces import ProcessingRequest
+
+    document = Document.objects.filter(pk=document_id).first()
+    dispatcher = ProcessingDispatcher.from_name(requested)
+    job_id = dispatcher.dispatch(
+        ProcessingRequest(
+            document_id=str(document_id),
+            company_id=str(document.company_id) if document and document.company_id else "",
+            user_id=str(document.uploaded_by_id) if document else "",
+            backend=requested,
+        )
+    )
+    return job_id, requested
